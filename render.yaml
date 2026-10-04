@@ -1,0 +1,50 @@
+services:
+  - type: web
+    name: telegram-paid-membership-bot
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: FLASK_SECRET_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_BOT_USERNAME
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: TELEGRAM_WEBHOOK_PATH
+        value: "/telegram-webhook"
+      - key: COINBASE_API_KEY
+        sync: false
+      - key: COINBASE_WEBHOOK_SECRET
+        sync: false
+      - key: COINBASE_WEBHOOK_PATH
+        value: "/coinbase-webhook"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: telegram-paid-membership-db
+          property: connectionString
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: STORAGE_CHAT_ID
+        sync: false
+      - key: PERMISSIONS_PHOTO_ID
+        sync: false
+      - key: PLATFORM_SHARE
+        sync: false
+      - key: MIN_WITHDRAWAL_USD
+        value: "10"
+      - key: DAILY_TASKS_TOKEN
+        sync: false
+
+databases:
+  - name: telegram-paid-membership-db
+    databaseName: membership
+    user: membership
+    plan: free
+    region: oregon

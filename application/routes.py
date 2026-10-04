@@ -2,9 +2,9 @@ from application import data as config
 import telebot
 import time
 import flask
+import hmac
 from application import payments_api
-from flask import request
-from flask import current_app as server
+from flask import Blueprint, request
 from .models import db, User, Group, Member
 import datetime
 import collections
@@ -15,22 +15,24 @@ from coinbase_commerce.webhook import Webhook
 logger = telebot.logger
 telebot.logger.setLevel(logging.ERROR)
 
-client = cc.Client("c92edadf-6e68-4e9e-b9e1-90813db1f043")
+client = cc.Client(config.coinbase_api_key)
 
 logging.basicConfig(
     filename='flow.log', 
     encoding='utf-8', 
     level=logging.DEBUG)
 logger=logging.getLogger(__name__)
-secret = "tgapi/v2"
 bot = telebot.TeleBot(config.token, threaded=False)
-https_tunnel = f"https://www.exceeddevll.tk/{secret}"
-bot.remove_webhook()
-bot.set_webhook(url=https_tunnel)
+blueprint = Blueprint("routes", __name__)
 
-@server.route(f'/{secret}', methods=['POST'])
+@blueprint.route(config.telegram_webhook_path, methods=['POST'])
 def webhook():
-    if flask.request.headers.get('content-type') == 'application/json':
+    if flask.request.headers.get('content-type', '').startswith('application/json'):
+        if not hmac.compare_digest(
+            flask.request.headers.get('X-Telegram-Bot-Api-Secret-Token', ''),
+            config.telegram_webhook_secret,
+        ):
+            flask.abort(403)
         json_string = flask.request.get_data().decode('utf-8')
         update = telebot.types.Update.de_json(json_string)
         bot.process_new_updates([update])
@@ -38,7 +40,7 @@ def webhook():
     else:
         flask.abort(403)
 
-@server.route("/apiendpointshouldbehardtoguessgg/1", methods=['POST'])
+@blueprint.route(config.coinbase_webhook_path, methods=['POST'])
 def redirecthandler():
     request_data = request.data.decode('utf-8')
     # webhook signature
@@ -561,8 +563,13 @@ def callback_query(call):
         d = d.split(":")
         bot.send_message(d[1], f"An amount of {d[2]} was approved and will reflect in your wallet in a few minutes")
 
-@server.route("/triggerdailytasks", methods=["GET"])
+@blueprint.route("/triggerdailytasks", methods=["POST"])
 def daily_task():
+    authorization = request.headers.get("Authorization", "")
+    if not hmac.compare_digest(
+        authorization, f"Bearer {config.daily_tasks_token}"
+    ):
+        return "Unauthorized", 401
     ddate = datetime.date.today() + datetime.timedelta(days=2)
     potential_warn = db.session.query(Member).filter_by(expiry = str(ddate)).all()
     # Group subscriptions into a list of lists where each sublist has subscriptions from only one user
@@ -597,9 +604,3 @@ def daily_task():
             bot.send_message(user.chat_id, f"An amount of ${member.group.cost} was used to renew your subscription to {chat.title}")
             continue
     return "Ok Done!", 200
-
-
-# Start flask server
-# if __name__ == "__main__":
-#    server.run(debug=True,host='0.0.0.0',port=int(os.environ.get('PORT', 5000)))
-#rootpp123
