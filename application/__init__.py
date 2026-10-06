@@ -1,9 +1,23 @@
 import os
+import logging
 
 from flask import Flask, jsonify
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 db = SQLAlchemy()
+logger = logging.getLogger(__name__)
+
+
+def health_check():
+    try:
+        with db.engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except SQLAlchemyError:
+        logger.exception("Health check database query failed")
+        return jsonify(status="unavailable", database="unavailable"), 503
+    return jsonify(status="ok", database="ok"), 200
 
 
 def create_app():
@@ -22,7 +36,7 @@ def create_app():
     server.add_url_rule(
         "/healthz",
         endpoint="health",
-        view_func=lambda: jsonify(status="ok"),
+        view_func=health_check,
         methods=["GET"],
     )
     server.add_url_rule(

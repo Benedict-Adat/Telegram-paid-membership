@@ -5,13 +5,21 @@ import flask
 import hmac
 from application import payments_api
 from flask import Blueprint, request
-from .models import db, User, Group, Member
+from .models import db, User, Group, Member, Payment
 import datetime
+from datetime import timezone
 import collections
 import logging
+import uuid
+import requests
 import coinbase_commerce as cc
-from coinbase_commerce.error import WebhookInvalidPayload, SignatureVerificationError
+from coinbase_commerce.error import (
+    CoinbaseError,
+    WebhookInvalidPayload,
+    SignatureVerificationError,
+)
 from coinbase_commerce.webhook import Webhook
+from sqlalchemy.exc import SQLAlchemyError
 logger = telebot.logger
 telebot.logger.setLevel(logging.ERROR)
 
@@ -51,16 +59,104 @@ def redirecthandler():
         event = Webhook.construct_event(request_data, request_sig, config.cc_secret_header)
     except (WebhookInvalidPayload, SignatureVerificationError) as e:
         return str(e), 400
-    if event.type =="charge:confirmed":
-        charge = client.charge.retrieve(event.data.code)
-        amt = 0.00
-        for payment in charge.payments:
-            amt += float(payment.net.local.amount)
-        if 1<len(charge.payments):
-            bot.send_message(config.dummychatid, "Rectify: {(charge.payments, charge.description, amt)}")
-        
-        chat_id = str(charge.description).split("-")[1]
-        credit((chat_id, amt))
+    if event.type == "charge:confirmed":
+        charge_code = event.data.code
+        try:
+            payment = (
+                db.session.query(Payment)
+                .filter_by(charge_code=charge_code)
+                .with_for_update()
+                .first()
+            )
+            charge = None
+            if payment is None:
+                charge = client.charge.retrieve(charge_code)
+                metadata = charge.metadata or {}
+                payment_reference = metadata.get("payment_reference")
+            else:
+                payment_reference = None
+            if payment is None and payment_reference:
+                payment = (
+                    db.session.query(Payment)
+                    .filter_by(idempotency_key=payment_reference)
+                    .with_for_update()
+                    .first()
+                )
+                if payment is not None:
+                    if payment.charge_code not in (None, charge_code):
+                        logger.error(
+                            "Coinbase payment reference was presented with a "
+                            "different charge code"
+                        )
+                        db.session.rollback()
+                        return "Payment reference mismatch", 400
+                    if payment.charge_code is None:
+                        payment.charge_code = charge_code
+                        db.session.flush()
+        except (CoinbaseError, requests.RequestException, SQLAlchemyError):
+            db.session.rollback()
+            logger.exception("Could not retrieve or correlate Coinbase charge")
+            return "Payment verification failed", 500
+
+        if payment is None:
+            logger.warning("Ignoring confirmed Coinbase charge with unknown code")
+            return "ok", 200
+        if payment.status == "processed":
+            return "ok", 200
+        if payment.status != "pending":
+            logger.warning(
+                "Ignoring confirmed Coinbase charge in state %s", payment.status
+            )
+            return "ok", 200
+        if charge is None:
+            try:
+                charge = client.charge.retrieve(charge_code)
+            except (CoinbaseError, requests.RequestException):
+                db.session.rollback()
+                logger.exception("Could not retrieve pending Coinbase charge")
+                return "Payment verification failed", 500
+
+        try:
+            amount = sum(
+                float(item.net.local.amount) for item in charge.payments
+            )
+            if amount <= 0:
+                raise ValueError("Confirmed Coinbase charge has no positive amount")
+            user = db.session.get(User, payment.user_chat_id)
+            if user is None:
+                logger.error(
+                    "Cannot credit confirmed Coinbase charge %s: user is missing",
+                    charge_code,
+                )
+                db.session.rollback()
+                return "Payment account not found", 500
+            user.wallet += amount
+            payment.amount = amount
+            payment.currency = "USD"
+            payment.status = "processed"
+            payment.processed_at = datetime.datetime.now(timezone.utc)
+            db.session.commit()
+        except (
+            CoinbaseError,
+            requests.RequestException,
+            ValueError,
+            TypeError,
+            AttributeError,
+            SQLAlchemyError,
+        ):
+            db.session.rollback()
+            logger.exception("Failed to process confirmed Coinbase charge")
+            return "Payment processing failed", 500
+
+        try:
+            bot.send_message(
+                payment.user_chat_id, f"Deposit Credited: ${amount}"
+            )
+        except telebot.apihelper.ApiTelegramException:
+            logger.exception(
+                "Credited Coinbase charge but failed to notify user %s",
+                payment.user_chat_id,
+            )
         return "ok", 200
     return "ok", 200
 
@@ -87,15 +183,6 @@ def register(chat_id):
         db.session.commit()
         print("also")
         return False
-
-def credit(data):
-    user = db.session.query(User).filter_by(chat_id=str(data[0])).first()
-    if not user:
-        print("Serious error, user not found in payment")
-        return
-    user.wallet += data[1]
-    db.session.commit()
-    bot.send_message(data[0], f"Deposit Credited: ${data[1]}")
 
 def profit(gainz):
     with open("gains.txt", "a") as f:
@@ -432,9 +519,51 @@ def texthandler(msg):
             total += i.group.cost
         bot.send_message(msg.chat.id, f"Your Wallet Balance: {w} USD\n\nYour Subscriptions cost: -${total}", reply_markup=config.walletmarkup)
     elif "Deposit" in msg.text:
-        link = payments_api.create_deposit_charge(msg.chat.id)
-        if not link:
-            bot.send_message(msg.chat.id, "An error occured in generating the payments page. Please contact support")
+        payment = Payment(
+            idempotency_key=str(uuid.uuid4()),
+            user_chat_id=str(msg.chat.id),
+            status="pending",
+        )
+        db.session.add(payment)
+        db.session.commit()
+        try:
+            charge_code, link = payments_api.create_deposit_charge(
+                msg.chat.id, payment.idempotency_key
+            )
+            payment.charge_code = charge_code
+            db.session.commit()
+        except requests.HTTPError as exc:
+            db.session.rollback()
+            if exc.response is not None and 400 <= exc.response.status_code < 500:
+                failed_payment = db.session.get(Payment, payment.id)
+                if failed_payment is not None:
+                    failed_payment.status = "failed"
+                    db.session.commit()
+            logger.exception(
+                "Coinbase rejected deposit charge creation or returned an "
+                "uncertain server response"
+            )
+            bot.send_message(
+                msg.chat.id,
+                "Payment page creation failed. Please try again later.",
+            )
+            return
+        except (
+            CoinbaseError,
+            requests.RequestException,
+            ValueError,
+            RuntimeError,
+            SQLAlchemyError,
+        ):
+            db.session.rollback()
+            logger.exception(
+                "Coinbase charge creation failed or is uncertain; "
+                "leaving the payment pending for reconciliation"
+            )
+            bot.send_message(
+                msg.chat.id,
+                "Payment page creation failed. Please try again later.",
+            )
             return
         bot.send_message(msg.chat.id, f"""
 Follow this link to deposit: 
@@ -601,6 +730,10 @@ def daily_task():
         else:
             chat = bot.get_chat(member.group.chat_id)
             settle_payment(user, member.group.user, member.group)
+            member.expiry = str(
+                datetime.date.today() + datetime.timedelta(days=30)
+            )
+            db.session.commit()
             bot.send_message(user.chat_id, f"An amount of ${member.group.cost} was used to renew your subscription to {chat.title}")
             continue
     return "Ok Done!", 200
